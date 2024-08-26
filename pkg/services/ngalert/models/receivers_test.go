@@ -6,6 +6,7 @@ import (
 
 	alertingNotify "github.com/grafana/alerting/notify"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/grafana/grafana/pkg/services/ngalert/notifier/channels_config"
 )
@@ -45,20 +46,19 @@ func TestReceiver_EncryptDecrypt(t *testing.T) {
 			secrets, err := channels_config.GetSecretKeysForContactPointType(integrationType)
 			assert.NoError(t, err)
 			for _, key := range secrets {
-				if val, ok := encrypted.Settings[key]; ok {
-					if s, isString := val.(string); isString {
-						encryptedVal, err := encryptFn(s)
-						assert.NoError(t, err)
-						encrypted.SecureSettings[key] = encryptedVal
-						delete(encrypted.Settings, key)
-					}
+				val, ok, err := extractField(encrypted.Settings, NewIntegrationFieldPath(key))
+				assert.NoError(t, err)
+				if ok {
+					encryptedVal, err := encryptFn(val)
+					assert.NoError(t, err)
+					encrypted.SecureSettings[key] = encryptedVal
 				}
 			}
 
 			testIntegration := decrypedIntegration.Clone()
 			err = testIntegration.Encrypt(encryptFn)
 			assert.NoError(t, err)
-			assert.Equal(t, encrypted, testIntegration)
+			require.Equal(t, encrypted, testIntegration)
 
 			err = testIntegration.Decrypt(decryptnFn)
 			assert.NoError(t, err)
@@ -80,12 +80,14 @@ func TestIntegration_Redact(t *testing.T) {
 			secrets, err := channels_config.GetSecretKeysForContactPointType(integrationType)
 			assert.NoError(t, err)
 			for _, key := range secrets {
-				if val, ok := expected.Settings[key]; ok {
-					if s, isString := val.(string); isString && s != "" {
-						expected.Settings[key] = redactFn(s)
+				err := setField(expected.Settings, NewIntegrationFieldPath(key), func(current any) any {
+					if s, isString := current.(string); isString && s != "" {
 						delete(expected.SecureSettings, key)
+						return redactFn(s)
 					}
-				}
+					return current
+				}, true)
+				require.NoError(t, err)
 			}
 
 			validIntegration.Redact(redactFn)
@@ -244,9 +246,9 @@ func TestIntegrationConfig(t *testing.T) {
 
 			for field := range config.Fields {
 				_, isSecret := allSecrets[field]
-				assert.Equal(t, isSecret, config.IsSecureField(field))
+				assert.Equalf(t, isSecret, config.IsSecureField(NewIntegrationFieldPath(field)), "field '%s' is expected to be secret", field)
 			}
-			assert.False(t, config.IsSecureField("__--**unknown_field**--__"))
+			assert.False(t, config.IsSecureField(IntegrationFieldPath{"__--**unknown_field**--__"}))
 		})
 	}
 
@@ -263,11 +265,13 @@ func TestIntegration_SecureFields(t *testing.T) {
 			t.Run("contains SecureSettings", func(t *testing.T) {
 				validIntegration := IntegrationGen(IntegrationMuts.WithValidConfig(integrationType))()
 				expected := make(map[string]bool, len(validIntegration.SecureSettings))
-				for field := range validIntegration.Config.Fields {
-					if validIntegration.Config.IsSecureField(field) {
-						expected[field] = true
-						validIntegration.SecureSettings[field] = "test"
-						delete(validIntegration.Settings, field)
+				for _, path := range validIntegration.Config.GetSecretFields() {
+					if validIntegration.Config.IsSecureField(path) {
+						expected[path.String()] = true
+						validIntegration.SecureSettings[path.String()] = "test"
+						_, _, err := extractField(validIntegration.Settings, path)
+						require.NoError(t, err)
+						continue
 					}
 				}
 				assert.Equal(t, expected, validIntegration.SecureFields())
@@ -276,11 +280,13 @@ func TestIntegration_SecureFields(t *testing.T) {
 			t.Run("contains secret Settings not in SecureSettings", func(t *testing.T) {
 				validIntegration := IntegrationGen(IntegrationMuts.WithValidConfig(integrationType))()
 				expected := make(map[string]bool, len(validIntegration.SecureSettings))
-				for field := range validIntegration.Config.Fields {
-					if validIntegration.Config.IsSecureField(field) {
-						expected[field] = true
-						validIntegration.Settings[field] = "test"
-						delete(validIntegration.SecureSettings, field)
+				for _, path := range validIntegration.Config.GetSecretFields() {
+					if validIntegration.Config.IsSecureField(path) {
+						expected[path.String()] = true
+						assert.NoError(t, setField(validIntegration.Settings, path, func(current any) any {
+							return "test"
+						}, false))
+						delete(validIntegration.SecureSettings, path.String())
 					}
 				}
 				assert.Equal(t, expected, validIntegration.SecureFields())
