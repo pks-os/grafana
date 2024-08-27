@@ -3,7 +3,6 @@ package provisioning
 import (
 	"context"
 	"errors"
-	"fmt"
 	"testing"
 	"time"
 
@@ -86,8 +85,21 @@ func TestProvisioningServiceImpl(t *testing.T) {
 		serviceTest.cancel()
 		serviceTest.waitForStop()
 
-		fmt.Println("serviceTest.serviceError", serviceTest.serviceError)
 		assert.Equal(t, context.Canceled, serviceTest.serviceError)
+	})
+
+	t.Run("Should set dashboard provisioner provisioning dashboards", func(t *testing.T) {
+		// The first dashboard provisioner instantiation takes place when
+		// setDashboardProvisioner() is called in setup(t).
+		serviceTest := setup(t)
+		// The second dashboard provisioner instantiation takes place when
+		// Run(ctx) is executed.
+		serviceTest.startService()
+
+		serviceTest.cancel()
+		serviceTest.waitForStop()
+
+		assert.Equal(t, 2, serviceTest.dashboardProvisionerInstantiations)
 	})
 }
 
@@ -101,6 +113,8 @@ type serviceTestStruct struct {
 
 	startService func()
 	cancel       func()
+
+	dashboardProvisionerInstantiations int
 
 	mock    *dashboards.ProvisionerMock
 	service *ProvisioningServiceImpl
@@ -122,6 +136,7 @@ func setup(t *testing.T) *serviceTestStruct {
 
 	serviceTest.service = newProvisioningServiceImpl(
 		func(context.Context, string, dashboardstore.DashboardProvisioningService, org.Service, utils.DashboardStore, folder.Service) (dashboards.DashboardProvisioner, error) {
+			serviceTest.dashboardProvisionerInstantiations++
 			return serviceTest.mock, nil
 		},
 		nil,
