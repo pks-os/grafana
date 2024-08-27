@@ -614,35 +614,8 @@ func (r *Receiver) Fingerprint() string {
 				writeString(secureSettings[name])
 			}
 		}
+		writeSettings(writeBytes, in.Settings)
 		writeSecureSettings(in.SecureSettings)
-
-		writeSettings := func(settings map[string]any) {
-			// maps do not guarantee predictable sequence of keys.
-			// Therefore, to make hash stable, we need to sort keys
-			if len(settings) == 0 {
-				return
-			}
-			idx := 0
-			for k := range settings {
-				keys[idx] = k
-				idx++
-			}
-			sub := keys[:idx]
-			sort.Strings(sub)
-			for _, name := range sub {
-				writeString(name)
-
-				// TODO: Improve this.
-				v := settings[name]
-				bytes, err := json.Marshal(v)
-				if err != nil {
-					writeString(fmt.Sprintf("%+v", v))
-				} else {
-					writeBytes(bytes)
-				}
-			}
-		}
-		writeSettings(in.Settings)
 	}
 
 	// fields that determine the rule state
@@ -655,4 +628,24 @@ func (r *Receiver) Fingerprint() string {
 	}
 
 	return fmt.Sprintf("%016x", sum.Sum64())
+}
+
+func writeSettings(w func([]byte), m map[string]any) {
+	keysIter := maps.Keys(m)
+	keys := slices.Collect(keysIter)
+	sort.Strings(keys)
+	for _, key := range keys {
+		switch v := m[key].(type) {
+		case string:
+			w([]byte(v))
+		case map[string]any:
+			writeSettings(w, v)
+		default:
+			b, err := json.Marshal(v)
+			if err != nil {
+				w([]byte(fmt.Sprintf("%+v", v)))
+			}
+			w(b)
+		}
+	}
 }

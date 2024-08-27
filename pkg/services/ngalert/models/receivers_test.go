@@ -312,8 +312,13 @@ func TestReceiver_Fingerprint(t *testing.T) {
 	))()
 	baseReceiver.Integrations[0].UID = "stable UID"
 	baseReceiver.Integrations[0].DisableResolveMessage = true
-	baseReceiver.Integrations[0].SecureSettings = map[string]string{"test2": "test2"}
-	baseReceiver.Integrations[0].Settings["broken"] = broken{f1: "this"}                                    // Add a broken type to ensure it is stable in the fingerprint.
+	baseReceiver.Integrations[0].SecureSettings = map[string]string{"test2": "test2", "test3": "test223", "test1": "rest22"}
+	baseReceiver.Integrations[0].Settings["broken"] = broken{f1: "this"} // Add a broken type to ensure it is stable in the fingerprint.
+	baseReceiver.Integrations[0].Settings["sub-map"] = map[string]any{
+		"setting":   "value",
+		"something": 123,
+		"data":      []string{"test"},
+	} // Add a broken type to ensure it is stable in the fingerprint.
 	baseReceiver.Integrations[0].Config = IntegrationConfig{Type: baseReceiver.Integrations[0].Config.Type} // Remove all fields except Type.
 
 	completelyDifferentReceiver := ReceiverGen(ReceiverMuts.WithName("test receiver2"), ReceiverMuts.WithIntegrations(
@@ -326,7 +331,7 @@ func TestReceiver_Fingerprint(t *testing.T) {
 	completelyDifferentReceiver.Integrations[0].Config = IntegrationConfig{Type: completelyDifferentReceiver.Integrations[0].Config.Type} // Remove all fields except Type.
 
 	t.Run("stable across code changes", func(t *testing.T) {
-		expectedFingerprint := "ae141b582965f4f5" // If this is a valid fingerprint generation change, update the expected value.
+		expectedFingerprint := "d21f092f74cf99ab" // If this is a valid fingerprint generation change, update the expected value.
 		assert.Equal(t, expectedFingerprint, baseReceiver.Fingerprint())
 	})
 	t.Run("stable across clones", func(t *testing.T) {
