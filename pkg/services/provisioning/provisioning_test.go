@@ -139,7 +139,7 @@ func setup(t *testing.T) *serviceTestStruct {
 
 	searchStub := searchV2.NewStubSearchService()
 
-	serviceTest.service = newProvisioningServiceImpl(
+	service, err := newProvisioningServiceImpl(
 		func(context.Context, string, dashboardstore.DashboardProvisioningService, org.Service, utils.DashboardStore, folder.Service) (dashboards.DashboardProvisioner, error) {
 			return serviceTest.mock, nil
 		},
@@ -147,7 +147,7 @@ func setup(t *testing.T) *serviceTestStruct {
 		nil,
 		searchStub,
 	)
-	err := serviceTest.service.setDashboardProvisioner()
+	serviceTest.service = service
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
