@@ -1743,6 +1743,18 @@
     },
     {
       "metadata": {
+        "name": "jaegerBackendMigration",
+        "resourceVersion": "1731599633815",
+        "creationTimestamp": "2024-11-14T15:53:53Z"
+      },
+      "spec": {
+        "description": "Enables querying the Jaeger data source without the proxy",
+        "stage": "experimental",
+        "codeowner": "@grafana/oss-big-tent"
+      }
+    },
+    {
+      "metadata": {
         "name": "jitterAlertRulesWithinGroups",
         "resourceVersion": "1718727528075",
         "creationTimestamp": "2024-01-18T18:48:11Z"
@@ -3088,12 +3100,15 @@
     {
       "metadata": {
         "name": "singleTopNav",
-        "resourceVersion": "1724861961030",
-        "creationTimestamp": "2024-08-29T08:48:32Z"
+        "resourceVersion": "1731664029942",
+        "creationTimestamp": "2024-08-29T08:48:32Z",
+        "annotations": {
+          "grafana.app/updatedTimestamp": "2024-11-15 09:47:09.942158 +0000 UTC"
+        }
       },
       "spec": {
         "description": "Unifies the top search bar and breadcrumb bar into one",
-        "stage": "experimental",
+        "stage": "preview",
         "codeowner": "@grafana/grafana-frontend-platform",
         "frontend": true
       }
