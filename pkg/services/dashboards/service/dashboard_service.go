@@ -26,6 +26,7 @@ import (
 	"k8s.io/client-go/dynamic"
 
 	"github.com/grafana/authlib/claims"
+
 	"github.com/grafana/grafana-plugin-sdk-go/backend/gtime"
 	"github.com/grafana/grafana/pkg/apimachinery/identity"
 	"github.com/grafana/grafana/pkg/apimachinery/utils"
@@ -37,7 +38,6 @@ import (
 	"github.com/grafana/grafana/pkg/services/accesscontrol"
 	"github.com/grafana/grafana/pkg/services/apiserver"
 	"github.com/grafana/grafana/pkg/services/apiserver/endpoints/request"
-	"github.com/grafana/grafana/pkg/services/authz/zanzana"
 	"github.com/grafana/grafana/pkg/services/dashboards"
 	"github.com/grafana/grafana/pkg/services/dashboards/dashboardaccess"
 	"github.com/grafana/grafana/pkg/services/datasources"
@@ -83,7 +83,6 @@ type DashboardServiceImpl struct {
 	folderPermissions    accesscontrol.FolderPermissionsService
 	dashboardPermissions accesscontrol.DashboardPermissionsService
 	ac                   accesscontrol.AccessControl
-	zclient              zanzana.Client
 	k8sclient            dashboardK8sHandler
 	metrics              *dashboardsMetrics
 }
@@ -109,7 +108,7 @@ func ProvideDashboardServiceImpl(
 	cfg *setting.Cfg, dashboardStore dashboards.Store, folderStore folder.FolderStore,
 	features featuremgmt.FeatureToggles, folderPermissionsService accesscontrol.FolderPermissionsService,
 	dashboardPermissionsService accesscontrol.DashboardPermissionsService, ac accesscontrol.AccessControl,
-	folderSvc folder.Service, fStore folder.Store, r prometheus.Registerer, zclient zanzana.Client,
+	folderSvc folder.Service, fStore folder.Store, r prometheus.Registerer,
 	restConfigProvider apiserver.RestConfigProvider, userService user.Service, unified resource.ResourceClient,
 	quotaService quota.Service, orgService org.Service,
 ) (*DashboardServiceImpl, error) {
@@ -128,7 +127,6 @@ func ProvideDashboardServiceImpl(
 		folderPermissions:    folderPermissionsService,
 		dashboardPermissions: dashboardPermissionsService,
 		ac:                   ac,
-		zclient:              zclient,
 		folderStore:          folderStore,
 		folderService:        folderSvc,
 		orgService:           orgService,
@@ -1214,19 +1212,12 @@ func (dr *DashboardServiceImpl) SearchDashboards(ctx context.Context, query *das
 	ctx, span := tracer.Start(ctx, "dashboards.service.SearchDashboards")
 	defer span.End()
 
-	var res []dashboards.DashboardSearchProjection
-	var err error
-	if dr.features.IsEnabled(ctx, featuremgmt.FlagZanzana) {
-		res, err = dr.FindDashboardsZanzana(ctx, query)
-	} else {
-		res, err = dr.FindDashboards(ctx, query)
-	}
+	res, err := dr.FindDashboards(ctx, query)
 	if err != nil {
 		return nil, err
 	}
 
 	hits := makeQueryResult(query, res)
-
 	return hits, nil
 }
 
@@ -1726,7 +1717,7 @@ func (dr *DashboardServiceImpl) searchDashboardsThroughK8sRaw(ctx context.Contex
 
 	if len(query.DashboardUIDs) > 0 {
 		request.Options.Fields = []*resource.Requirement{{
-			Key:      "key.name",
+			Key:      resource.SEARCH_FIELD_NAME,
 			Operator: string(selection.In),
 			Values:   query.DashboardUIDs,
 		}}
@@ -1745,7 +1736,7 @@ func (dr *DashboardServiceImpl) searchDashboardsThroughK8sRaw(ctx context.Contex
 
 	if len(query.FolderUIDs) > 0 {
 		req := []*resource.Requirement{{
-			Key:      "folder",
+			Key:      resource.SEARCH_FIELD_FOLDER,
 			Operator: string(selection.In),
 			Values:   query.FolderUIDs,
 		}}
@@ -1754,7 +1745,7 @@ func (dr *DashboardServiceImpl) searchDashboardsThroughK8sRaw(ctx context.Contex
 
 	if query.ProvisionedRepo != "" {
 		req := []*resource.Requirement{{
-			Key:      "repo.name",
+			Key:      resource.SEARCH_FIELD_REPOSITORY_NAME,
 			Operator: string(selection.In),
 			Values:   []string{query.ProvisionedRepo},
 		}}
@@ -1763,7 +1754,7 @@ func (dr *DashboardServiceImpl) searchDashboardsThroughK8sRaw(ctx context.Contex
 
 	if len(query.ProvisionedReposNotIn) > 0 {
 		req := []*resource.Requirement{{
-			Key:      "repo.name",
+			Key:      resource.SEARCH_FIELD_REPOSITORY_NAME,
 			Operator: string(selection.NotIn),
 			Values:   query.ProvisionedReposNotIn,
 		}}
@@ -1771,7 +1762,7 @@ func (dr *DashboardServiceImpl) searchDashboardsThroughK8sRaw(ctx context.Contex
 	}
 	if query.ProvisionedPath != "" {
 		req := []*resource.Requirement{{
-			Key:      "repo.path",
+			Key:      resource.SEARCH_FIELD_REPOSITORY_PATH,
 			Operator: string(selection.In),
 			Values:   []string{query.ProvisionedPath},
 		}}
@@ -1784,7 +1775,7 @@ func (dr *DashboardServiceImpl) searchDashboardsThroughK8sRaw(ctx context.Contex
 	// but is currently not needed by other services in the backend
 	if query.Title != "" {
 		req := []*resource.Requirement{{
-			Key:      "title",
+			Key:      resource.SEARCH_FIELD_TITLE,
 			Operator: string(selection.In),
 			Values:   []string{query.Title},
 		}}
@@ -1793,11 +1784,15 @@ func (dr *DashboardServiceImpl) searchDashboardsThroughK8sRaw(ctx context.Contex
 
 	if len(query.Tags) > 0 {
 		req := []*resource.Requirement{{
-			Key:      "tags",
+			Key:      resource.SEARCH_FIELD_TAGS,
 			Operator: string(selection.In),
 			Values:   query.Tags,
 		}}
 		request.Options.Fields = append(request.Options.Fields, req...)
+	}
+
+	if query.Limit > 0 {
+		request.Limit = query.Limit
 	}
 
 	res, err := dr.k8sclient.getSearcher().Search(ctx, request)
