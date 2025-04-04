@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,16 +14,18 @@ import (
 	"k8s.io/utils/ptr"
 
 	claims "github.com/grafana/authlib/types"
+	dashboardOG "github.com/grafana/grafana/apps/dashboard/pkg/apis/dashboard"
+	dashboard "github.com/grafana/grafana/apps/dashboard/pkg/apis/dashboard/v1alpha1"
 	"github.com/grafana/grafana/pkg/apimachinery/apis/common/v0alpha1"
 	"github.com/grafana/grafana/pkg/apimachinery/identity"
 	"github.com/grafana/grafana/pkg/apimachinery/utils"
-	dashboard "github.com/grafana/grafana/pkg/apis/dashboard"
 	"github.com/grafana/grafana/pkg/components/simplejson"
+	"github.com/grafana/grafana/pkg/registry/apis/dashboard/legacysearcher"
 	"github.com/grafana/grafana/pkg/services/apiserver/endpoints/request"
 	gapiutil "github.com/grafana/grafana/pkg/services/apiserver/utils"
 	"github.com/grafana/grafana/pkg/services/dashboards"
-	"github.com/grafana/grafana/pkg/services/dashboards/service"
 	"github.com/grafana/grafana/pkg/services/provisioning"
+	"github.com/grafana/grafana/pkg/services/search/sort"
 	"github.com/grafana/grafana/pkg/storage/legacysql"
 	"github.com/grafana/grafana/pkg/storage/unified/resource"
 	"github.com/grafana/grafana/pkg/storage/unified/sql/sqltemplate"
@@ -54,8 +56,8 @@ type dashboardSqlAccess struct {
 	provisioning provisioning.ProvisioningService
 
 	// Use for writing (not reading)
-	dashStore  dashboards.Store
-	softDelete bool
+	dashStore             dashboards.Store
+	dashboardSearchClient legacysearcher.DashboardSearchClient
 
 	// Typically one... the server wrapper
 	subscribers []chan *resource.WrittenEvent
@@ -66,14 +68,15 @@ func NewDashboardAccess(sql legacysql.LegacyDatabaseProvider,
 	namespacer request.NamespaceMapper,
 	dashStore dashboards.Store,
 	provisioning provisioning.ProvisioningService,
-	softDelete bool,
+	sorter sort.Service,
 ) DashboardAccess {
+	dashboardSearchClient := legacysearcher.NewDashboardSearchClient(dashStore, sorter)
 	return &dashboardSqlAccess{
-		sql:          sql,
-		namespacer:   namespacer,
-		dashStore:    dashStore,
-		provisioning: provisioning,
-		softDelete:   softDelete,
+		sql:                   sql,
+		namespacer:            namespacer,
+		dashStore:             dashStore,
+		provisioning:          provisioning,
+		dashboardSearchClient: *dashboardSearchClient,
 	}
 }
 
@@ -98,9 +101,9 @@ func (a *dashboardSqlAccess) getRows(ctx context.Context, sql *legacysql.LegacyD
 		return nil, fmt.Errorf("execute template %q: %w", tmpl.Name(), err)
 	}
 	q := rawQuery
-	// if true {
-	// 	pretty := sqltemplate.RemoveEmptyLines(rawQuery)
-	// 	fmt.Printf("DASHBOARD QUERY: %s [%+v] // %+v\n", pretty, req.GetArgs(), query)
+	// if false {
+	// 	 pretty := sqltemplate.RemoveEmptyLines(rawQuery)
+	//	 fmt.Printf("DASHBOARD QUERY: %s [%+v] // %+v\n", pretty, req.GetArgs(), query)
 	// }
 
 	rows, err := sql.DB.GetSqlxSession().Query(ctx, q, req.GetArgs()...)
@@ -111,8 +114,9 @@ func (a *dashboardSqlAccess) getRows(ctx context.Context, sql *legacysql.LegacyD
 		rows = nil
 	}
 	return &rowsWrapper{
-		rows: rows,
-		a:    a,
+		rows:    rows,
+		a:       a,
+		history: query.GetHistory,
 		// This looks up rules from the permissions on a user
 		canReadDashboard: func(scopes ...string) bool {
 			return true // ???
@@ -124,14 +128,19 @@ func (a *dashboardSqlAccess) getRows(ctx context.Context, sql *legacysql.LegacyD
 var _ resource.ListIterator = (*rowsWrapper)(nil)
 
 type rowsWrapper struct {
-	a    *dashboardSqlAccess
-	rows *sql.Rows
+	a       *dashboardSqlAccess
+	rows    *sql.Rows
+	history bool
+	count   int
 
 	canReadDashboard func(scopes ...string) bool
 
 	// Current
 	row *dashboardRow
 	err error
+
+	// max 100 rejected?
+	rejected []dashboardRow
 }
 
 func (a *dashboardSqlAccess) GetResourceStats(ctx context.Context, namespace string, minCount int) ([]resource.ResourceStats, error) {
@@ -153,10 +162,16 @@ func (r *rowsWrapper) Next() bool {
 
 	// breaks after first readable value
 	for r.rows.Next() {
-		r.row, err = r.a.scanRow(r.rows)
+		r.count++
+
+		r.row, err = r.a.scanRow(r.rows, r.history)
 		if err != nil {
-			r.err = err
-			return false
+			if len(r.rejected) > 1000 || r.row == nil {
+				r.err = fmt.Errorf("too many rejected rows (%d) %w", len(r.rejected), err)
+				return false
+			}
+			r.rejected = append(r.rejected, *r.row)
+			continue
 		}
 
 		if r.row != nil {
@@ -171,7 +186,7 @@ func (r *rowsWrapper) Next() bool {
 				continue
 			}
 
-			// returns the first folder it can
+			// returns the first visible dashboard
 			return true
 		}
 	}
@@ -180,6 +195,11 @@ func (r *rowsWrapper) Next() bool {
 
 // ContinueToken implements resource.ListIterator.
 func (r *rowsWrapper) ContinueToken() string {
+	return r.row.token.String()
+}
+
+// ContinueTokenWithCurrentRV implements resource.ListIterator.
+func (r *rowsWrapper) ContinueTokenWithCurrentRV() string {
 	return r.row.token.String()
 }
 
@@ -214,7 +234,7 @@ func (r *rowsWrapper) Value() []byte {
 	return b
 }
 
-func (a *dashboardSqlAccess) scanRow(rows *sql.Rows) (*dashboardRow, error) {
+func (a *dashboardSqlAccess) scanRow(rows *sql.Rows, history bool) (*dashboardRow, error) {
 	dash := &dashboard.Dashboard{
 		TypeMeta:   dashboard.DashboardResourceInfo.TypeMeta(),
 		ObjectMeta: metav1.ObjectMeta{Annotations: make(map[string]string)},
@@ -233,8 +253,9 @@ func (a *dashboardSqlAccess) scanRow(rows *sql.Rows) (*dashboardRow, error) {
 	var createdBy sql.NullString
 	var createdByID sql.NullInt64
 	var message sql.NullString
+	var apiVersion sql.NullString
 
-	var plugin_id string
+	var plugin_id sql.NullString
 	var origin_name sql.NullString
 	var origin_path sql.NullString
 	var origin_ts sql.NullInt64
@@ -247,14 +268,22 @@ func (a *dashboardSqlAccess) scanRow(rows *sql.Rows) (*dashboardRow, error) {
 		&origin_name, &origin_path, &origin_hash, &origin_ts,
 		&created, &createdBy, &createdByID,
 		&updated, &updatedBy, &updatedByID,
-		&version, &message, &data,
+		&version, &message, &data, &apiVersion,
 	)
+	if apiVersion.String == "" {
+		apiVersion.String = "v0alpha1" // default value
+	}
 
 	row.token = &continueToken{orgId: orgId, id: dashboard_id}
+	// when listing from the history table, we want to use the version as the ID to continue from
+	if history {
+		row.token.id = version
+	}
 	if err == nil {
-		row.RV = getResourceVersion(dashboard_id, version)
+		row.RV = version
 		dash.ResourceVersion = fmt.Sprintf("%d", row.RV)
 		dash.Namespace = a.namespacer(orgId)
+		dash.APIVersion = fmt.Sprintf("%s/%s", dashboard.GROUP, apiVersion.String)
 		dash.UID = gapiutil.CalculateClusterWideUID(dash)
 		dash.SetCreationTimestamp(metav1.NewTime(created))
 		meta, err := utils.MetaAccessor(dash)
@@ -284,40 +313,36 @@ func (a *dashboardSqlAccess) scanRow(rows *sql.Rows) (*dashboardRow, error) {
 		}
 
 		if origin_name.String != "" {
-			ts := time.Unix(origin_ts.Int64, 0)
-
-			repo := &utils.ResourceRepositoryInfo{
-				Name:      origin_name.String,
-				Hash:      origin_hash.String,
-				Timestamp: &ts,
-			}
 			// if the reader cannot be found, it may be an orphaned provisioned dashboard
 			resolvedPath := a.provisioning.GetDashboardProvisionerResolvedPath(origin_name.String)
 			if resolvedPath != "" {
-				originPath, err := filepath.Rel(
-					resolvedPath,
-					origin_path.String,
-				)
-				if err != nil {
-					return nil, err
-				}
-				repo.Path = originPath
+				meta.SetSourceProperties(utils.SourceProperties{
+					Path:            origin_path.String,
+					Checksum:        origin_hash.String,
+					TimestampMillis: origin_ts.Int64,
+				})
+				meta.SetManagerProperties(utils.ManagerProperties{
+					Kind:     utils.ManagerKindClassicFP, // nolint:staticcheck
+					Identity: origin_name.String,
+				})
 			}
-			meta.SetRepositoryInfo(repo)
-		} else if plugin_id != "" {
-			meta.SetRepositoryInfo(&utils.ResourceRepositoryInfo{
-				Name: "plugin",
-				Path: plugin_id,
+		} else if plugin_id.String != "" {
+			meta.SetManagerProperties(utils.ManagerProperties{
+				Kind:     utils.ManagerKindPlugin,
+				Identity: plugin_id.String,
 			})
 		}
 
 		if len(data) > 0 {
 			err = dash.Spec.UnmarshalJSON(data)
 			if err != nil {
-				return row, err
+				return row, fmt.Errorf("JSON unmarshal error for: %s // %w", dash.Name, err)
 			}
 		}
-		dash.Spec.Remove("id")
+		// Ignore any saved values for id/version/uid
+		delete(dash.Spec.Object, "id")
+		delete(dash.Spec.Object, "version")
+		delete(dash.Spec.Object, "uid")
 	}
 	return row, err
 }
@@ -339,16 +364,6 @@ func (a *dashboardSqlAccess) DeleteDashboard(ctx context.Context, orgId int64, u
 		return nil, false, err
 	}
 
-	if a.softDelete {
-		err = a.dashStore.SoftDeleteDashboard(ctx, orgId, uid)
-		if err == nil && dash != nil {
-			now := metav1.NewTime(time.Now())
-			dash.DeletionTimestamp = &now
-			return dash, true, err
-		}
-		return dash, false, err
-	}
-
 	err = a.dashStore.DeleteDashboard(ctx, &dashboards.DeleteDashboardCommand{
 		OrgID: orgId,
 		UID:   uid,
@@ -359,8 +374,7 @@ func (a *dashboardSqlAccess) DeleteDashboard(ctx context.Context, orgId int64, u
 	return dash, true, nil
 }
 
-// SaveDashboard implements DashboardAccess.
-func (a *dashboardSqlAccess) SaveDashboard(ctx context.Context, orgId int64, dash *dashboard.Dashboard) (*dashboard.Dashboard, bool, error) {
+func (a *dashboardSqlAccess) buildSaveDashboardCommand(ctx context.Context, orgId int64, dash *dashboard.Dashboard) (*dashboards.SaveDashboardCommand, bool, error) {
 	created := false
 	user, ok := claims.AuthInfoFrom(ctx)
 	if !ok || user == nil {
@@ -377,6 +391,7 @@ func (a *dashboardSqlAccess) SaveDashboard(ctx context.Context, orgId int64, das
 		})
 		if old != nil {
 			dash.Spec.Set("id", old.ID)
+			dash.Spec.Set("version", float64(old.Version))
 		} else {
 			dash.Spec.Remove("id") // existing of "id" makes it an update
 			created = true
@@ -391,22 +406,40 @@ func (a *dashboardSqlAccess) SaveDashboard(ctx context.Context, orgId int64, das
 		var err error
 		userID, err = identity.UserIdentifier(user.GetSubject())
 		if err != nil {
-			return nil, false, err
+			return nil, created, err
 		}
 	}
 
+	apiVersion := strings.TrimPrefix(dash.APIVersion, dashboard.GROUP+"/")
 	meta, err := utils.MetaAccessor(dash)
 	if err != nil {
-		return nil, false, err
+		return nil, created, err
 	}
-	out, err := a.dashStore.SaveDashboard(ctx, dashboards.SaveDashboardCommand{
-		OrgID:     orgId,
-		PluginID:  service.GetPluginIDFromMeta(meta),
-		Dashboard: simplejson.NewFromAny(dash.Spec.UnstructuredContent()),
-		FolderUID: meta.GetFolder(),
-		Overwrite: true, // already passed the revisionVersion checks!
-		UserID:    userID,
-	})
+
+	return &dashboards.SaveDashboardCommand{
+		OrgID:      orgId,
+		Message:    meta.GetMessage(),
+		PluginID:   dashboardOG.GetPluginIDFromMeta(meta),
+		Dashboard:  simplejson.NewFromAny(dash.Spec.UnstructuredContent()),
+		FolderUID:  meta.GetFolder(),
+		Overwrite:  true, // already passed the revisionVersion checks!
+		UserID:     userID,
+		APIVersion: apiVersion,
+	}, created, nil
+}
+
+func (a *dashboardSqlAccess) SaveDashboard(ctx context.Context, orgId int64, dash *dashboard.Dashboard) (*dashboard.Dashboard, bool, error) {
+	user, ok := claims.AuthInfoFrom(ctx)
+	if !ok || user == nil {
+		return nil, false, fmt.Errorf("no user found in context")
+	}
+
+	cmd, created, err := a.buildSaveDashboardCommand(ctx, orgId, dash)
+	if err != nil {
+		return nil, created, err
+	}
+
+	out, err := a.dashStore.SaveDashboard(ctx, *cmd)
 	if err != nil {
 		return nil, false, err
 	}
@@ -416,6 +449,8 @@ func (a *dashboardSqlAccess) SaveDashboard(ctx context.Context, orgId int64, das
 	dash, _, err = a.GetDashboard(ctx, orgId, out.UID, 0)
 	if err != nil {
 		return nil, false, err
+	} else if dash == nil {
+		return nil, false, fmt.Errorf("unable to retrieve dashboard after save")
 	}
 
 	// stash the raw value in context (if requested)
@@ -437,12 +472,12 @@ func (a *dashboardSqlAccess) GetLibraryPanels(ctx context.Context, query Library
 		return nil, fmt.Errorf("expected non zero orgID")
 	}
 
-	sql, err := a.sql(ctx)
+	sqlx, err := a.sql(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	req := newLibraryQueryReq(sql, &query)
+	req := newLibraryQueryReq(sqlx, &query)
 	rawQuery, err := sqltemplate.Execute(sqlQueryPanels, req)
 	if err != nil {
 		return nil, fmt.Errorf("execute template %q: %w", sqlQueryPanels.Name(), err)
@@ -450,7 +485,7 @@ func (a *dashboardSqlAccess) GetLibraryPanels(ctx context.Context, query Library
 	q := rawQuery
 
 	res := &dashboard.LibraryPanelList{}
-	rows, err := sql.DB.GetSqlxSession().Query(ctx, q, req.GetArgs()...)
+	rows, err := sqlx.DB.GetSqlxSession().Query(ctx, q, req.GetArgs()...)
 	defer func() {
 		if rows != nil {
 			_ = rows.Close()
@@ -463,7 +498,7 @@ func (a *dashboardSqlAccess) GetLibraryPanels(ctx context.Context, query Library
 	type panel struct {
 		ID        int64
 		UID       string
-		FolderUID string
+		FolderUID sql.NullString
 
 		Created   time.Time
 		CreatedBy string
@@ -535,7 +570,9 @@ func (a *dashboardSqlAccess) GetLibraryPanels(ctx context.Context, query Library
 		if err != nil {
 			return nil, err
 		}
-		meta.SetFolder(p.FolderUID)
+		if p.FolderUID.Valid {
+			meta.SetFolder(p.FolderUID.String)
+		}
 		meta.SetCreatedBy(p.CreatedBy)
 		meta.SetGeneration(1)
 		meta.SetDeprecatedInternalID(p.ID) //nolint:staticcheck
@@ -554,7 +591,7 @@ func (a *dashboardSqlAccess) GetLibraryPanels(ctx context.Context, query Library
 		}
 	}
 	if query.UID == "" {
-		rv, err := sql.GetResourceVersion(ctx, "library_element", "updated")
+		rv, err := sqlx.GetResourceVersion(ctx, "library_element", "updated")
 		if err == nil {
 			res.ResourceVersion = strconv.FormatInt(rv, 10)
 		}
