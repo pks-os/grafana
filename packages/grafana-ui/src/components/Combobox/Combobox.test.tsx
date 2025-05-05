@@ -192,7 +192,7 @@ describe('Combobox', () => {
       const input = screen.getByRole('combobox');
       await userEvent.click(input);
 
-      const allHeaders = await screen.findAllByRole('presentation');
+      const allHeaders = await screen.findAllByTestId('combobox-option-group');
       expect(allHeaders).toHaveLength(2);
 
       const listbox = await screen.findByRole('listbox');
@@ -219,7 +219,7 @@ describe('Combobox', () => {
       const input = screen.getByRole('combobox');
       await userEvent.click(input);
 
-      const allHeaders = await screen.findAllByRole('presentation');
+      const allHeaders = await screen.findAllByTestId('combobox-option-group');
 
       expect(allHeaders[0]).toHaveTextContent('Group 1');
       expect(allHeaders[1]).toHaveTextContent('');
@@ -633,3 +633,12 @@ describe('Combobox', () => {
     });
   });
 });
+
+// Type test
+(() => {
+  // Handler function does not allow null for option.
+  function onChangeHandlerNoNull(option: ComboboxOption<string>) {}
+  // @ts-expect-error with isClearable set, onChange can pass `null`, so a function that does not accept null
+  // is an error. If this line errors, then the conditional typing for onChange has been broken.
+  return <Combobox options={options} value={null} onChange={onChangeHandlerNoNull} isClearable />;
+})();
